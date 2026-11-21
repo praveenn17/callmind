@@ -13,7 +13,66 @@ const server = http.createServer(app);
 
 // Configuration from environment variables
 const PORT = process.env.PORT || 5000;
-const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:5173";
+const RAW_CLIENT_URL = process.env.CLIENT_URL || "http://localhost:5173";
+
+// Robust parsing & sanitization of allowed origins (handles accidental "CLIENT_URL=..." prefix in Render dashboard)
+function parseAllowedOrigins(raw) {
+  const defaults = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "https://callmind-frontend.vercel.app",
+  ];
+  if (!raw) return defaults;
+
+  // Strip accidental "CLIENT_URL=" prefix or quotes if pasted verbatim into Render config
+  let cleaned = raw.replace(/^CLIENT_URL\s*=\s*/i, "").trim();
+  cleaned = cleaned.replace(/^['"](.*)['"]$/, "$1").trim();
+
+  const parsed = cleaned
+    .split(",")
+    .map((item) => item.trim().replace(/\/+$/, ""))
+    .filter(Boolean);
+
+  return Array.from(new Set([...parsed, ...defaults]));
+}
+
+const allowedOrigins = parseAllowedOrigins(RAW_CLIENT_URL);
+
+// Dynamic origin validator function for Express CORS and Socket.io
+function isOriginAllowed(origin) {
+  if (!origin) return true; // Allow non-browser requests (e.g. curl, server-to-server)
+  const normalized = origin.trim().replace(/\/+$/, "");
+
+  // 1. Explicitly configured origins
+  if (allowedOrigins.includes(normalized)) return true;
+
+  // 2. Any Vercel deployment domain (*.vercel.app)
+  if (normalized.endsWith(".vercel.app") || /^https:\/\/[a-z0-9-]+-.*\.vercel\.app$/.test(normalized)) {
+    return true;
+  }
+
+  // 3. Any localhost port
+  if (/^https?:\/\/localhost(:\d+)?$/.test(normalized)) {
+    return true;
+  }
+
+  return false;
+}
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (isOriginAllowed(origin)) {
+      callback(null, true);
+    } else {
+      console.warn(`[CORS Blocked] Origin not allowed: ${origin}`);
+      callback(new Error(`CORS not allowed for origin: ${origin}`));
+    }
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+};
+
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
@@ -26,13 +85,8 @@ const supabaseAdmin = createClient(
 );
 
 // Enable CORS for Express REST routes
-app.use(
-  cors({
-    origin: CLIENT_URL,
-    methods: ["GET", "POST"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions)); // Handle explicit preflight requests
 app.use(express.json());
 
 // In-Memory Basic Rate Limiter (20 requests per minute per IP)
@@ -575,11 +629,18 @@ User Question: ${question.trim()}`;
   }
 });
 
-// Configure Socket.io with CORS
+// Configure Socket.io with dynamic CORS
 const io = new Server(server, {
   cors: {
-    origin: CLIENT_URL,
+    origin: (origin, callback) => {
+      if (isOriginAllowed(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error(`Socket CORS not allowed for origin: ${origin}`));
+      }
+    },
     methods: ["GET", "POST"],
+    credentials: true,
   },
 });
 
@@ -676,8 +737,9 @@ io.on("connection", (socket) => {
 server.listen(PORT, () => {
   console.log(`=========================================`);
   console.log(`CallMind Server running on port ${PORT}`);
-  console.log(`CORS allowed origin: ${CLIENT_URL}`);
+  console.log(`CORS allowed origins: ${allowedOrigins.join(", ")}`);
   console.log(`Health check: http://localhost:${PORT}/health`);
   console.log(`AI Intelligence Endpoint: POST /api/analyze-call`);
+  console.log(`Ask Calls Endpoint: POST /api/ask-calls`);
   console.log(`=========================================`);
 });
